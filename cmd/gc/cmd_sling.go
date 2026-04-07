@@ -456,6 +456,13 @@ func doSling(opts slingOpts, deps slingDeps, querier BeadQuerier) int {
 	if !opts.IsFormula && !opts.Force {
 		result := checkBeadState(querier, opts.BeadOrFormula, a)
 		if result.Idempotent {
+			if result.RepairMeta && deps.Store != nil {
+				if err := deps.Store.SetMetadata(opts.BeadOrFormula, "gc.routed_to", a.QualifiedName()); err != nil {
+					fmt.Fprintf(deps.Stderr, "gc sling: repairing gc.routed_to on %s: %v\n", opts.BeadOrFormula, err) //nolint:errcheck // best-effort
+				} else {
+					fmt.Fprintf(deps.Stdout, "Bead %s had pool label but missing gc.routed_to — repaired metadata\n", opts.BeadOrFormula) //nolint:errcheck // best-effort
+				}
+			}
 			if opts.DryRun {
 				return dryRunSingle(opts, deps, querier)
 			}
@@ -748,6 +755,13 @@ func doSlingBatch(opts slingOpts, deps slingDeps, querier BeadChildQuerier) int 
 		if !opts.Force {
 			result := checkBeadState(querier, child.ID, a)
 			if result.Idempotent {
+				if result.RepairMeta && deps.Store != nil {
+					if err := deps.Store.SetMetadata(child.ID, "gc.routed_to", a.QualifiedName()); err != nil {
+						fmt.Fprintf(deps.Stderr, "gc sling: repairing gc.routed_to on %s: %v\n", child.ID, err) //nolint:errcheck // best-effort
+					} else {
+						fmt.Fprintf(deps.Stdout, "  Bead %s had pool label but missing gc.routed_to — repaired metadata\n", child.ID) //nolint:errcheck // best-effort
+					}
+				}
 				fmt.Fprintf(deps.Stdout, "  Skipped %s — already routed to %s\n", child.ID, a.QualifiedName()) //nolint:errcheck // best-effort
 				idempotent++
 				continue
@@ -1431,6 +1445,7 @@ func targetType(a *config.Agent) string {
 // beadCheckResult captures the outcome of a pre-flight bead state check.
 type beadCheckResult struct {
 	Idempotent bool     // bead already routed to the same target
+	RepairMeta bool     // pool label present but gc.routed_to metadata missing — caller should set it
 	Warnings   []string // warnings about existing routing to different targets
 }
 
@@ -1501,11 +1516,14 @@ func checkBeadState(q BeadQuerier, beadID string, a config.Agent) beadCheckResul
 	// Multi-session targets: pool labels are a legacy fallback only when
 	// gc.routed_to is absent. If gc.routed_to is set (even to a different
 	// target), it is authoritative — a stale pool label must not short-circuit.
+	// When the pool label matches but gc.routed_to is missing, signal the
+	// caller to repair the metadata so the controller's scale_check can
+	// discover the bead.
 	if strings.TrimSpace(b.Metadata["gc.routed_to"]) == "" {
 		poolLabel := "pool:" + target
 		for _, l := range b.Labels {
 			if l == poolLabel {
-				return beadCheckResult{Idempotent: true}
+				return beadCheckResult{Idempotent: true, RepairMeta: true}
 			}
 		}
 	}

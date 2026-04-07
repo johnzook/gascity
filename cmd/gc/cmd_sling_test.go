@@ -2917,6 +2917,63 @@ func TestCheckBeadStateDifferentPoolLabel(t *testing.T) {
 	}
 }
 
+func TestCheckBeadStatePoolLabelWithoutMetadataRepairMeta(t *testing.T) {
+	// Bug fix: pool label matching target but missing gc.routed_to metadata
+	// should be idempotent (skip re-routing) but signal RepairMeta so the
+	// caller sets gc.routed_to for the controller's scale_check.
+	q := &fakeQuerier{bead: beads.Bead{ID: "BL-42", Labels: []string{"pool:hw/polecat"}}}
+	a := config.Agent{Name: "polecat", Dir: "hw", MinActiveSessions: intPtr(1), MaxActiveSessions: intPtr(3)}
+
+	result := checkBeadState(q, "BL-42", a)
+	if !result.Idempotent {
+		t.Error("expected Idempotent=true when pool label matches (bead is already routed)")
+	}
+	if !result.RepairMeta {
+		t.Error("expected RepairMeta=true when pool label matches but gc.routed_to is missing")
+	}
+}
+
+func TestDoSlingPoolLabelMismatchRepairsMetadata(t *testing.T) {
+	runner := newFakeRunner()
+	sp := runtime.NewFake()
+	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
+	a := config.Agent{Name: "polecat", Dir: "hw", MinActiveSessions: intPtr(1), MaxActiveSessions: intPtr(3)}
+	// Pool label present but gc.routed_to metadata missing — the mismatch scenario.
+	q := &fakeQuerier{bead: beads.Bead{ID: "BL-42", Labels: []string{"pool:hw/polecat"}}}
+
+	deps, stdout, _ := testDeps(cfg, sp, runner.run)
+	// Seed the store with the bead so SetMetadata can find it.
+	deps.Store = beads.NewMemStoreFrom(1, []beads.Bead{
+		{ID: "BL-42", Title: "Work", Type: "task", Status: "open", Labels: []string{"pool:hw/polecat"}},
+	}, nil)
+	opts := testOpts(a, "BL-42")
+	code := doSling(opts, deps, q)
+
+	if code != 0 {
+		t.Fatalf("doSling returned %d, want 0", code)
+	}
+	// Should be idempotent — no routing command executed.
+	if len(runner.calls) != 0 {
+		t.Errorf("mismatch repair should not re-route; got %d calls: %v", len(runner.calls), runner.calls)
+	}
+	// Should report the repair.
+	if !strings.Contains(stdout.String(), "repaired metadata") {
+		t.Errorf("stdout = %q, want repair message", stdout.String())
+	}
+	// Should still report idempotent skip.
+	if !strings.Contains(stdout.String(), "skipping (idempotent)") {
+		t.Errorf("stdout = %q, want idempotent message", stdout.String())
+	}
+	// Verify gc.routed_to was actually set on the store.
+	repaired, err := deps.Store.Get("BL-42")
+	if err != nil {
+		t.Fatalf("store.Get after repair: %v", err)
+	}
+	if got := repaired.Metadata["gc.routed_to"]; got != "hw/polecat" {
+		t.Errorf("gc.routed_to = %q after repair, want %q", got, "hw/polecat")
+	}
+}
+
 func TestDoSlingIdempotentSkipsRouting(t *testing.T) {
 	runner := newFakeRunner()
 	sp := runtime.NewFake()
