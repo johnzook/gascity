@@ -471,13 +471,23 @@ func (f *Fake) LastStartConfig(name string) *Config {
 	return nil
 }
 
-// RunLive records the call and returns nil (or error if broken).
-func (f *Fake) RunLive(name string, _ Config) error {
+const appliedLiveHashMetaKey = "GC_LIVE_HASH_APPLIED"
+
+// RunLive records the call and stores the applied live fingerprint.
+func (f *Fake) RunLive(name string, cfg Config) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.Calls = append(f.Calls, Call{Method: "RunLive", Name: name})
 	if f.broken {
 		return fmt.Errorf("session unavailable")
 	}
+	if f.meta[name] == nil {
+		f.meta[name] = make(map[string]string)
+	}
+	if len(cfg.SessionLive) == 0 {
+		delete(f.meta[name], appliedLiveHashMetaKey)
+		return nil
+	}
+	f.meta[name][appliedLiveHashMetaKey] = LiveFingerprint(cfg)
 	return nil
 }

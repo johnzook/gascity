@@ -2053,6 +2053,38 @@ func TestReconcileSessionBeads_LiveDriftAppliedWhenNoStoredHash(t *testing.T) {
 	}
 }
 
+func TestReconcileSessionBeads_LiveStateDriftReappliedWhenAppliedHashMissing(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
+	live := []string{"echo theme-applied"}
+	env.addDesiredLive("worker", "worker", true, live)
+	session := env.createSessionBead("worker", "worker")
+	env.markSessionActive(&session)
+
+	expectedCfg := templateParamsToConfig(env.desiredState["worker"])
+	expectedLive := runtime.LiveFingerprint(expectedCfg)
+	env.setSessionMetadata(&session, map[string]string{
+		"live_hash":         expectedLive,
+		"started_live_hash": expectedLive,
+	})
+
+	env.reconcile([]beads.Bead{session})
+
+	runLiveCalled := false
+	for _, call := range env.sp.Calls {
+		if call.Method == "RunLive" && call.Name == "worker" {
+			runLiveCalled = true
+			break
+		}
+	}
+	if !runLiveCalled {
+		t.Fatal("expected RunLive to repair missing applied live hash")
+	}
+	if got, _ := env.sp.GetMeta("worker", appliedLiveHashMetaKey); got != expectedLive {
+		t.Fatalf("applied live hash = %q, want %q", got, expectedLive)
+	}
+}
+
 func TestReconcileSessionBeads_LiveHashBackfilledSilentlyWhenNoLiveConfig(t *testing.T) {
 	env := newReconcilerTestEnv()
 	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
