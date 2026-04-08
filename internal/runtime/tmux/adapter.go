@@ -29,6 +29,8 @@ type Provider struct {
 
 var instanceTokenReader = rand.Reader
 
+const appliedLiveHashMetaKey = "GC_LIVE_HASH_APPLIED"
+
 // Compile-time check.
 var (
 	_ runtime.Provider               = (*Provider)(nil)
@@ -105,6 +107,10 @@ func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) e
 
 	err = doStartSession(ctx, &tmuxStartOps{tm: p.tm}, name, cfg, p.cfg.SetupTimeout)
 	if err == nil {
+		if err := p.recordAppliedLiveHash(name, cfg); err != nil {
+			p.cleanupFailedStart(name, cfg)
+			return fmt.Errorf("recording session_live state: %w", err)
+		}
 		p.cache.Invalidate()
 		return nil
 	}
@@ -170,8 +176,17 @@ func (p *Provider) cleanupFailedStart(name string, cfg runtime.Config) {
 // RunLive re-applies session_live commands to a running session.
 // Called by the reconciler when only session_live config has changed.
 func (p *Provider) RunLive(name string, cfg runtime.Config) error {
-	runSessionLive(context.Background(), &tmuxStartOps{tm: p.tm}, name, cfg, os.Stderr, p.cfg.SetupTimeout)
-	return nil
+	if err := runSessionLive(context.Background(), &tmuxStartOps{tm: p.tm}, name, cfg, os.Stderr, p.cfg.SetupTimeout); err != nil {
+		return err
+	}
+	return p.recordAppliedLiveHash(name, cfg)
+}
+
+func (p *Provider) recordAppliedLiveHash(name string, cfg runtime.Config) error {
+	if len(cfg.SessionLive) == 0 {
+		return p.RemoveMeta(name, appliedLiveHashMetaKey)
+	}
+	return p.SetMeta(name, appliedLiveHashMetaKey, runtime.LiveFingerprint(cfg))
 }
 
 // Stop destroys the named session and kills its entire process tree.
@@ -611,7 +626,9 @@ func doStartSession(ctx context.Context, ops startOps, name string, cfg runtime.
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	runSessionLive(ctx, ops, name, cfg, os.Stderr, setupTimeout)
+	if err := runSessionLive(ctx, ops, name, cfg, os.Stderr, setupTimeout); err != nil {
+		return err
+	}
 
 	return nil
 }
@@ -648,9 +665,9 @@ func runSessionSetup(ctx context.Context, ops startOps, name string, cfg runtime
 // runSessionLive runs session_live commands (idempotent, re-applicable).
 // Called at startup after nudge, and by the reconciler on live-only drift.
 // Non-fatal: warnings on failure, session still works.
-func runSessionLive(ctx context.Context, ops startOps, name string, cfg runtime.Config, stderr io.Writer, setupTimeout time.Duration) {
+func runSessionLive(ctx context.Context, ops startOps, name string, cfg runtime.Config, stderr io.Writer, setupTimeout time.Duration) error {
 	if len(cfg.SessionLive) == 0 {
-		return
+		return nil
 	}
 
 	// Build env vars for live commands.
@@ -660,11 +677,14 @@ func runSessionLive(ctx context.Context, ops startOps, name string, cfg runtime.
 	}
 	setupEnv["GC_SESSION"] = name
 
+	var errs []error
 	for i, cmd := range cfg.SessionLive {
 		if err := ops.runSetupCommand(ctx, cmd, setupEnv, setupTimeout); err != nil {
 			_, _ = fmt.Fprintf(stderr, "gc: session_live[%d] warning: %v\n", i, err)
+			errs = append(errs, fmt.Errorf("session_live[%d]: %w", i, err))
 		}
 	}
+	return errors.Join(errs...)
 }
 
 // runPreStart runs pre_start commands before session creation.

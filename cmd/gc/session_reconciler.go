@@ -26,6 +26,8 @@ import (
 	"github.com/gastownhall/gascity/internal/telemetry"
 )
 
+const appliedLiveHashMetaKey = "GC_LIVE_HASH_APPLIED"
+
 const maxIdleSleepProbesPerTick = 3
 
 type wakeTarget struct {
@@ -556,7 +558,11 @@ func reconcileSessionBeadsTraced(
 					// the started_config_hash pattern above.
 					storedLive := session.Metadata["started_live_hash"]
 					currentLive := runtime.LiveFingerprint(agentCfg)
-					if storedLive != currentLive {
+					appliedLive, metaErr := sp.GetMeta(name, appliedLiveHashMetaKey)
+					if metaErr != nil {
+						fmt.Fprintf(stderr, "session reconciler: GetMeta %s %s: %v\n", name, appliedLiveHashMetaKey, metaErr) //nolint:errcheck
+					}
+					if storedLive != currentLive || (len(agentCfg.SessionLive) > 0 && appliedLive != currentLive) {
 						if storedLive == "" && len(agentCfg.SessionLive) == 0 {
 							// No stored hash and no live config — silently
 							// backfill the hash without running anything.
