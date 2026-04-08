@@ -637,6 +637,62 @@ func TestResolveSessionIDMaterializingNamed_RecreatesClosedConfiguredNamedSessio
 	}
 }
 
+func TestResolveSessionIDMaterializingNamed_AllowsClosedLegacyCanonicalName(t *testing.T) {
+	t.Setenv("GC_SESSION", "fake")
+
+	store := beads.NewMemStore()
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{{
+			Name:         "mechanik",
+			StartCommand: "true",
+		}},
+		NamedSessions: []config.NamedSession{{
+			Template: "mechanik",
+		}},
+	}
+
+	legacyRuntimeName := config.NamedSessionRuntimeName(cfg.EffectiveCityName(), cfg.Workspace, "mechanik")
+	legacy, err := store.Create(beads.Bead{
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"session_name":          legacyRuntimeName,
+			"session_name_explicit": "true",
+			"template":              "mechanik",
+			"close_reason":          "orphaned",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(legacy): %v", err)
+	}
+	if err := store.Close(legacy.ID); err != nil {
+		t.Fatalf("Close(legacy): %v", err)
+	}
+
+	id, err := resolveSessionIDMaterializingNamed(t.TempDir(), cfg, store, "mechanik")
+	if err != nil {
+		t.Fatalf("resolveSessionIDMaterializingNamed(mechanik): %v", err)
+	}
+	if id == legacy.ID {
+		t.Fatalf("resolveSessionIDMaterializingNamed(mechanik) = %q, want fresh canonical bead", id)
+	}
+
+	bead, err := store.Get(id)
+	if err != nil {
+		t.Fatalf("store.Get(%s): %v", id, err)
+	}
+	if bead.Status != "open" {
+		t.Fatalf("status = %q, want open", bead.Status)
+	}
+	if got := bead.Metadata["alias"]; got != "mechanik" {
+		t.Fatalf("alias = %q, want mechanik", got)
+	}
+	if got := bead.Metadata["session_name"]; got != legacyRuntimeName {
+		t.Fatalf("session_name = %q, want %q", got, legacyRuntimeName)
+	}
+}
+
 func TestResolveSessionIDMaterializingNamed_UsesCityUniqueBareNamedTarget(t *testing.T) {
 	t.Setenv("GC_SESSION", "fake")
 
