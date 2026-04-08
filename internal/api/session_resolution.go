@@ -382,7 +382,7 @@ func (s *Server) materializeNamedSessionWithContext(ctx context.Context, store b
 			return err
 		}
 		var createErr error
-		info, createErr = mgr.CreateAliasedNamedWithTransportAndMetadata(
+		info, createErr = mgr.CreateAliasedNamedWithTransportAndMetadataReserved(
 			ctx,
 			spec.Identity,
 			spec.SessionName,

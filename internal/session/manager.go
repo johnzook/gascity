@@ -217,16 +217,23 @@ func (m *Manager) CreateWithTransport(ctx context.Context, template, title, comm
 // CreateAliasedNamedWithTransport creates a new chat session bead with an
 // optional public alias and optional explicit runtime session_name.
 func (m *Manager) CreateAliasedNamedWithTransport(ctx context.Context, alias, explicitName, template, title, command, workDir, provider, transport string, env map[string]string, resume ProviderResume, hints runtime.Config) (Info, error) {
-	return m.createAliasedNamedWithTransport(ctx, alias, explicitName, template, title, command, workDir, provider, transport, env, resume, hints, nil)
+	return m.createAliasedNamedWithTransport(ctx, alias, explicitName, template, title, command, workDir, provider, transport, env, resume, hints, nil, false)
 }
 
 // CreateAliasedNamedWithTransportAndMetadata creates a new chat session bead
 // with additional metadata published atomically at bead creation time.
 func (m *Manager) CreateAliasedNamedWithTransportAndMetadata(ctx context.Context, alias, explicitName, template, title, command, workDir, provider, transport string, env map[string]string, resume ProviderResume, hints runtime.Config, extraMeta map[string]string) (Info, error) {
-	return m.createAliasedNamedWithTransport(ctx, alias, explicitName, template, title, command, workDir, provider, transport, env, resume, hints, extraMeta)
+	return m.createAliasedNamedWithTransport(ctx, alias, explicitName, template, title, command, workDir, provider, transport, env, resume, hints, extraMeta, false)
 }
 
-func (m *Manager) createAliasedNamedWithTransport(ctx context.Context, alias, explicitName, template, title, command, workDir, provider, transport string, env map[string]string, resume ProviderResume, hints runtime.Config, extraMeta map[string]string) (Info, error) {
+// CreateAliasedNamedWithTransportAndMetadataReserved creates a named session
+// after the caller has already acquired the relevant identifier locks and
+// performed config-aware availability checks.
+func (m *Manager) CreateAliasedNamedWithTransportAndMetadataReserved(ctx context.Context, alias, explicitName, template, title, command, workDir, provider, transport string, env map[string]string, resume ProviderResume, hints runtime.Config, extraMeta map[string]string) (Info, error) {
+	return m.createAliasedNamedWithTransport(ctx, alias, explicitName, template, title, command, workDir, provider, transport, env, resume, hints, extraMeta, true)
+}
+
+func (m *Manager) createAliasedNamedWithTransport(ctx context.Context, alias, explicitName, template, title, command, workDir, provider, transport string, env map[string]string, resume ProviderResume, hints runtime.Config, extraMeta map[string]string, identifiersReserved bool) (Info, error) {
 	alias, err := ValidateAlias(alias)
 	if err != nil {
 		return Info{}, err
@@ -240,11 +247,13 @@ func (m *Manager) createAliasedNamedWithTransport(ctx context.Context, alias, ex
 	}
 	var info Info
 	err = withSessionIdentifierReservationLocks([]string{alias, explicitName}, func() error {
-		if err := ensureSessionAliasAvailable(m.store, nil, alias, "", ""); err != nil {
-			return err
-		}
-		if err := ensureSessionNameAvailable(m.store, explicitName); err != nil {
-			return err
+		if !identifiersReserved {
+			if err := ensureSessionAliasAvailable(m.store, nil, alias, "", ""); err != nil {
+				return err
+			}
+			if err := ensureSessionNameAvailable(m.store, explicitName); err != nil {
+				return err
+			}
 		}
 
 		// Generate session key only when the provider supports Generate & Pass
@@ -430,16 +439,23 @@ func (m *Manager) CreateBeadOnly(template, title, command, workDir, provider, tr
 // runtime process, preserving an optional public alias and explicit runtime
 // session_name for the reconciler.
 func (m *Manager) CreateAliasedBeadOnlyNamed(alias, explicitName, template, title, command, workDir, provider, transport string, _ map[string]string, resume ProviderResume) (Info, error) {
-	return m.createAliasedBeadOnlyNamed(alias, explicitName, template, title, command, workDir, provider, transport, resume, nil)
+	return m.createAliasedBeadOnlyNamed(alias, explicitName, template, title, command, workDir, provider, transport, resume, nil, false)
 }
 
 // CreateAliasedBeadOnlyNamedWithMetadata creates a session bead without
 // starting the runtime process, publishing extra metadata atomically.
 func (m *Manager) CreateAliasedBeadOnlyNamedWithMetadata(alias, explicitName, template, title, command, workDir, provider, transport string, resume ProviderResume, extraMeta map[string]string) (Info, error) {
-	return m.createAliasedBeadOnlyNamed(alias, explicitName, template, title, command, workDir, provider, transport, resume, extraMeta)
+	return m.createAliasedBeadOnlyNamed(alias, explicitName, template, title, command, workDir, provider, transport, resume, extraMeta, false)
 }
 
-func (m *Manager) createAliasedBeadOnlyNamed(alias, explicitName, template, title, command, workDir, provider, transport string, resume ProviderResume, extraMeta map[string]string) (Info, error) {
+// CreateAliasedBeadOnlyNamedWithMetadataReserved creates a bead-only named
+// session after the caller has already acquired the relevant identifier locks
+// and performed config-aware availability checks.
+func (m *Manager) CreateAliasedBeadOnlyNamedWithMetadataReserved(alias, explicitName, template, title, command, workDir, provider, transport string, resume ProviderResume, extraMeta map[string]string) (Info, error) {
+	return m.createAliasedBeadOnlyNamed(alias, explicitName, template, title, command, workDir, provider, transport, resume, extraMeta, true)
+}
+
+func (m *Manager) createAliasedBeadOnlyNamed(alias, explicitName, template, title, command, workDir, provider, transport string, resume ProviderResume, extraMeta map[string]string, identifiersReserved bool) (Info, error) {
 	alias, err := ValidateAlias(alias)
 	if err != nil {
 		return Info{}, err
@@ -453,11 +469,13 @@ func (m *Manager) createAliasedBeadOnlyNamed(alias, explicitName, template, titl
 	}
 	var info Info
 	err = withSessionIdentifierReservationLocks([]string{alias, explicitName}, func() error {
-		if err := ensureSessionAliasAvailable(m.store, nil, alias, "", ""); err != nil {
-			return err
-		}
-		if err := ensureSessionNameAvailable(m.store, explicitName); err != nil {
-			return err
+		if !identifiersReserved {
+			if err := ensureSessionAliasAvailable(m.store, nil, alias, "", ""); err != nil {
+				return err
+			}
+			if err := ensureSessionNameAvailable(m.store, explicitName); err != nil {
+				return err
+			}
 		}
 
 		var sessionKey string

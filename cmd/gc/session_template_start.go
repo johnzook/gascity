@@ -151,7 +151,7 @@ func materializeSessionForTemplateWithOptions(
 						return err
 					}
 					var err error
-					info, err = mgr.CreateAliasedBeadOnlyNamedWithMetadata(
+					info, err = mgr.CreateAliasedBeadOnlyNamedWithMetadataReserved(
 						spec.Identity,
 						spec.SessionName,
 						spec.Identity,
@@ -197,7 +197,7 @@ func materializeSessionForTemplateWithOptions(
 				return err
 			}
 			var createErr error
-			info, createErr = mgr.CreateAliasedNamedWithTransportAndMetadata(
+			info, createErr = mgr.CreateAliasedNamedWithTransportAndMetadataReserved(
 				context.Background(),
 				spec.Identity,
 				spec.SessionName,
