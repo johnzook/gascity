@@ -13,26 +13,44 @@ Your role is determined by the GC_AGENT environment variable and injected by
 ### Dolt Server
 
 Dolt is the data plane for beads (issues, mail, work history). It runs as a
-single server on port 3307 serving all databases. **It is fragile.**
+single server serving all databases. **It is fragile — and Deacon owns its
+health.** If you are not the Deacon: retry once, capture symptoms, nudge
+Deacon. Do not diagnose, restart, or run `gc doctor` for Dolt yourself.
 
-If you detect Dolt trouble (commands hang/timeout, "connection refused",
-"database not found", query latency > 5s, unexpected empty results):
+**Deacon's diagnostic protocol** (when commands hang/timeout, "connection
+refused", "database not found", query latency > 5s, unexpected empty results):
 
 **BEFORE restarting Dolt, collect diagnostics.** Dolt hangs are hard to
-reproduce. A blind restart destroys the evidence. Always:
+reproduce. A blind restart destroys the evidence. Use only **non-blocking,
+non-signaling** probes — never send signals to Dolt for diagnostics.
+
+> **Never `kill -QUIT` (or any other signal) Dolt to capture state.**
+> Dolt is a Go binary with no custom SIGQUIT handler. Go's runtime default
+> for SIGQUIT is *dump goroutine stacks and exit* — SIGQUIT will kill Dolt.
+> The same applies to SIGABRT and SIGFPE. Only the gc lifecycle commands
+> (`gc dolt stop`, `gc dolt start`) should ever change Dolt's process state.
 
 ```bash
-# 1. Capture goroutine dump (safe — does not kill the process)
-kill -QUIT $(cat {{ .CityRoot }}/.gc/runtime/packs/dolt/dolt.pid)
+DOLT_PID=$(cat {{ .CityRoot }}/.gc/runtime/packs/dolt/dolt.pid)
+LOG=/tmp/dolt-hang-$(date +%s).log
 
-# 2. Capture server status while it's still (mis)behaving
-gc dolt status 2>&1 | tee /tmp/dolt-hang-$(date +%s).log
+# 1. Server-level state (non-blocking)
+gc dolt status                                                      >>"$LOG" 2>&1
+tail -200 {{ .CityRoot }}/.gc/runtime/packs/dolt/dolt.log           >>"$LOG"
 
-# 3. THEN escalate with the evidence
-gc mail send mayor -s "Dolt: <describe symptom>" -m "<paste evidence>"
+# 2. OS-level state (no signals — just /proc and ss)
+cat /proc/$DOLT_PID/status                                          >>"$LOG" 2>&1
+ls /proc/$DOLT_PID/fd 2>/dev/null | wc -l | sed 's/^/open_fds: /'   >>"$LOG"
+ss -tnp 2>/dev/null | grep "pid=$DOLT_PID"                          >>"$LOG"
+
+# 3. SQL liveness probe with a hard timeout — a timeout is itself evidence
+timeout 5 gc dolt list                                              >>"$LOG" 2>&1
+
+# 4. THEN escalate
+gc mail send mayor -s "Dolt: <describe symptom>" -m "$(cat "$LOG")"
 ```
 
-**Do NOT just `gc dolt stop && gc dolt start` without steps 1-2.**
+**Do NOT just `gc dolt stop && gc dolt start` without step 1.**
 
 Orphan databases (testdb_*, beads_t*, beads_pt*) accumulate on the production
 server and degrade performance. Use `gc dolt cleanup` to remove them safely.
@@ -72,5 +90,5 @@ EOF
 - Nudge, don't mail for routine communication
 - Don't create unnecessary beads — file real work, not scratchpads
 - Close your beads — open beads that linger become pollution
-- When Dolt is slow/down: check `gc doctor`, nudge Deacon — don't restart Dolt yourself
+- When Dolt is slow/down: retry once, then nudge Deacon
 {{ end }}
