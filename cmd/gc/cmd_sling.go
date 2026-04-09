@@ -323,6 +323,23 @@ func cmdSling(args []string, isFormula, doNudge, force bool, title string, vars 
 	store := beads.NewBdStore(storeDir, beads.ExecCommandRunnerWithEnv(storeEnv))
 	storeRef := workflowStoreRefForDir(storeDir, cityPath, cfg.Workspace.Name, cfg)
 
+	// Cross-rig copy: if the input is a bead ID that lives in another rig
+	// store (HQ or a sibling rig), copy its content into the local store
+	// before routing. Without this, the polecat in the target rig would see
+	// either an empty stub (auto-created from the bare ID) or fail to find
+	// the bead at all. The helper propagates title, description, type,
+	// priority, and labels so the polecat sees actionable work, and stamps
+	// gc.original_bead_id metadata so callers can trace back to the source.
+	if !isFormula && !dryRun && !beadExistsInStore(store, beadOrFormula) {
+		newID, ok, copyErr := copyCrossRigBead(beadOrFormula, store, cfg, cityPath, storeDir, stdout, stderr)
+		if copyErr != nil {
+			return 1
+		}
+		if ok {
+			beadOrFormula = newID
+		}
+	}
+
 	// Inline text mode: if the argument doesn't look like a bead ID
 	// (and we're not in formula mode), create a task bead from the text.
 	// Skip during dry-run to avoid side effects.
@@ -2039,4 +2056,119 @@ func checkCrossRig(beadID string, a config.Agent, cfg *config.City) string {
 	}
 	return fmt.Sprintf("gc sling: cross-rig routing blocked — bead %s (prefix %q) targets %s (rig prefix %q); use --force to override",
 		beadID, bp, a.QualifiedName(), rp)
+}
+
+// crossRigBeadLookup is the function used by cmdSling to find a bead in
+// non-current stores. Replaceable in tests so we can exercise the cross-rig
+// copy logic without real bd subprocesses.
+var crossRigBeadLookup = lookupBeadInOtherStores
+
+// copyCrossRigBead inspects beadID and, if it lives in another rig store,
+// copies its content into localStore. Returns the new local bead ID, a
+// boolean indicating whether a copy occurred, and an error if the copy
+// itself failed (the caller should treat this as fatal). When the bead is
+// not found in any sibling store, returns ("", false, nil) so the caller
+// can fall through to inline-text creation. The function is broken out
+// from cmdSling so it can be exercised with MemStores in unit tests.
+func copyCrossRigBead(
+	beadID string,
+	localStore beads.Store,
+	cfg *config.City,
+	cityPath, currentDir string,
+	stdout, stderr io.Writer,
+) (string, bool, error) {
+	origBead, origDir, found := crossRigBeadLookup(cfg, cityPath, currentDir, beadID)
+	if !found {
+		return "", false, nil
+	}
+	copy := beads.Bead{
+		Title:       origBead.Title,
+		Description: formatCrossRigCopyDescription(origBead.Description, beadID, origDir),
+		Type:        origBead.Type,
+		Priority:    origBead.Priority,
+		Labels:      origBead.Labels,
+	}
+	created, err := localStore.Create(copy)
+	if err != nil {
+		fmt.Fprintf(stderr, "gc sling: copying cross-rig bead %s: %v\n", beadID, err) //nolint:errcheck // best-effort stderr
+		return "", false, err
+	}
+	// Best-effort: link back to the original. Non-fatal if it fails; the
+	// copy still has actionable content.
+	if metaErr := localStore.SetMetadata(created.ID, "gc.original_bead_id", beadID); metaErr != nil {
+		fmt.Fprintf(stderr, "gc sling: setting gc.original_bead_id on %s: %v\n", created.ID, metaErr) //nolint:errcheck // best-effort
+	}
+	fmt.Fprintf(stdout, "Copied %s → %s — %q\n", beadID, created.ID, origBead.Title) //nolint:errcheck // best-effort stdout
+	return created.ID, true, nil
+}
+
+// lookupBeadInOtherStores searches for a bead ID in stores other than
+// currentDir. It checks the rig store matching the bead's prefix and the
+// city HQ store when the prefix matches the workspace prefix. Returns the
+// bead, the directory it was found in, and true on success. Returns
+// (zero, "", false) when the bead can't be located in any sibling store.
+//
+// This powers the cross-rig sling fix: when an agent in rig A slings a
+// bead that lives in rig B (or HQ), the bead's content is copied into A
+// instead of an empty stub being auto-created.
+func lookupBeadInOtherStores(cfg *config.City, cityPath, currentDir, beadID string) (beads.Bead, string, bool) {
+	if cfg == nil {
+		return beads.Bead{}, "", false
+	}
+	bp := beadPrefix(beadID)
+	if bp == "" {
+		return beads.Bead{}, "", false
+	}
+
+	var candidates []string
+
+	// Try the rig matching the bead prefix.
+	if rig, found := findRigByPrefix(cfg, bp); found {
+		rigPath := rig.Path
+		if !filepath.IsAbs(rigPath) {
+			rigPath = filepath.Join(cityPath, rigPath)
+		}
+		if !samePath(rigPath, currentDir) {
+			candidates = append(candidates, rigPath)
+		}
+	}
+
+	// Try the city HQ store if the bead prefix matches the workspace prefix.
+	if strings.EqualFold(bp, config.EffectiveHQPrefix(cfg)) {
+		if !samePath(cityPath, currentDir) {
+			candidates = append(candidates, cityPath)
+		}
+	}
+
+	for _, dir := range candidates {
+		var env map[string]string
+		if samePath(dir, cityPath) {
+			env = bdRuntimeEnv(cityPath)
+		} else {
+			env = bdRuntimeEnvForRig(cityPath, cfg, dir)
+		}
+		store := beads.NewBdStore(dir, beads.ExecCommandRunnerWithEnv(env))
+		bead, err := store.Get(beadID)
+		if err == nil {
+			return bead, dir, true
+		}
+	}
+	return beads.Bead{}, "", false
+}
+
+// formatCrossRigCopyDescription builds the description body for a cross-rig
+// copy: a "> Original: <id> (from <rig>)" header followed by the original
+// description (or just the header if the original is empty). The header
+// makes it obvious to the polecat (and to humans browsing the bead) where
+// the work originated.
+func formatCrossRigCopyDescription(originalDescription, originalID, originalDir string) string {
+	label := filepath.Base(filepath.Clean(originalDir))
+	if label == "" || label == "." || label == "/" {
+		label = originalDir
+	}
+	header := fmt.Sprintf("> **Original**: %s (from %s)", originalID, label)
+	if strings.TrimSpace(originalDescription) == "" {
+		return header
+	}
+	return header + "\n\n" + originalDescription
 }
