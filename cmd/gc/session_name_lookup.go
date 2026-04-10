@@ -178,6 +178,11 @@ func lookupSessionNameOrLegacy(store beads.Store, cityName, qualifiedName, sessi
 // under the given template-qualified agent. The result maps the logical
 // instance qualified name (for example "frontend/worker-1") to the actual
 // runtime session name.
+//
+// The key is always built from the template + pool_slot so beads created by
+// createPoolSessionBead (which sets agent_name to the bare template name)
+// are indexed under the instance-qualified form rather than collapsing onto
+// the shared template key.
 func lookupPoolSessionNames(store beads.Store, template string) (map[string]string, error) {
 	result := make(map[string]string)
 	if store == nil {
@@ -204,12 +209,11 @@ func lookupPoolSessionNames(store beads.Store, template string) (map[string]stri
 		if sessionName == "" {
 			continue
 		}
-		if agentName == "" {
-			agentName = template + "-" + b.Metadata["pool_slot"]
-		}
-		if agentName != "" {
-			result[agentName] = sessionName
-		}
+		// Canonical key: template + "-" + pool_slot. This is what
+		// discoverPoolInstances emits for bounded numeric pools, and is
+		// robust to beads where agent_name is the bare template (as
+		// createPoolSessionBead sets it) rather than the instance name.
+		result[template+"-"+b.Metadata["pool_slot"]] = sessionName
 	}
 	return result, nil
 }

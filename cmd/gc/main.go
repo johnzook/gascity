@@ -194,6 +194,30 @@ func cliSessionName(cityPath, cityName, agentName, sessionTemplate string) strin
 	return sessionName(store, cityName, agentName, sessionTemplate)
 }
 
+// cliPoolSessionNames returns the bead-backed map of pool instance qualified
+// names (e.g., "gascity/polecat-1") to their runtime tmux session names
+// (e.g., "polecat-lx-abc123") for the given template. Returns nil if the
+// bead store is unavailable. Uses the shared cliStoreCache so callers that
+// already reached cliSessionName in the same command don't pay for a second
+// store open.
+func cliPoolSessionNames(cityPath, template string) map[string]string {
+	cliStoreCache.mu.Lock()
+	if cliStoreCache.path != cityPath {
+		cliStoreCache.store, _ = openCityStoreAt(cityPath)
+		cliStoreCache.path = cityPath
+	}
+	store := cliStoreCache.store
+	cliStoreCache.mu.Unlock()
+	if store == nil {
+		return nil
+	}
+	m, err := lookupPoolSessionNames(store, template)
+	if err != nil {
+		return nil
+	}
+	return m
+}
+
 // resolvedContext holds the result of city+rig resolution.
 type resolvedContext struct {
 	CityPath string // absolute path to city root

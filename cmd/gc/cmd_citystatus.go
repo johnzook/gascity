@@ -161,8 +161,17 @@ func doCityStatus(
 					maxDisplay = "max=unlimited"
 				}
 				fmt.Fprintf(stdout, "  %-24spool (min=%d, %s)\n", a.QualifiedName(), sp0.Min, maxDisplay) //nolint:errcheck // best-effort stdout
+				// Look up real pool session names from the bead store so
+				// instances launched with bead-derived session_name (e.g.,
+				// "polecat-lx-abc") are recognized as running instead of
+				// the synthetic name from cliSessionName. Falls back to
+				// the synthetic name when a slot has no bead.
+				poolNames := cliPoolSessionNames(cityPath, a.QualifiedName())
 				for _, qualifiedInstance := range discoverPoolInstances(a.Name, a.Dir, sp0, &a, cityName, cfg.Workspace.SessionTemplate, sp) {
-					sn := cliSessionName(cityPath, cityName, qualifiedInstance, cfg.Workspace.SessionTemplate)
+					sn := poolNames[qualifiedInstance]
+					if sn == "" {
+						sn = cliSessionName(cityPath, cityName, qualifiedInstance, cfg.Workspace.SessionTemplate)
+					}
 					status := agentStatusLine(sp, dops, sn, suspended)
 					fmt.Fprintf(stdout, "    %-22s%s\n", qualifiedInstance, status) //nolint:errcheck // best-effort stdout
 					totalAgents++
@@ -259,10 +268,16 @@ func doCityStatusJSON(
 		}
 
 		if isMultiSessionCfgAgent(&a) {
-			// Multi-session agent — emit each instance.
+			// Multi-session agent — emit each instance. Look up real pool
+			// session names from the bead store so instances launched with
+			// bead-derived session_name are recognized as running.
+			poolNames := cliPoolSessionNames(cityPath, a.QualifiedName())
 			for _, qualifiedInstance := range discoverPoolInstances(a.Name, a.Dir, sp0, &a, cityName, cfg.Workspace.SessionTemplate, sp) {
 				_, instanceName := config.ParseQualifiedName(qualifiedInstance)
-				sn := cliSessionName(cityPath, cityName, qualifiedInstance, cfg.Workspace.SessionTemplate)
+				sn := poolNames[qualifiedInstance]
+				if sn == "" {
+					sn = cliSessionName(cityPath, cityName, qualifiedInstance, cfg.Workspace.SessionTemplate)
+				}
 				running := sp.IsRunning(sn)
 				agents = append(agents, StatusAgentJSON{
 					Name:          instanceName,

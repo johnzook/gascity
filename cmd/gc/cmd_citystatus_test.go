@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/runtime"
 )
@@ -144,6 +145,146 @@ func TestCityStatusPoolExpansion(t *testing.T) {
 	// Summary: 2/3 running.
 	if !strings.Contains(out, "2/3 agents running") {
 		t.Errorf("stdout missing '2/3 agents running', got:\n%s", out)
+	}
+}
+
+// injectCliStoreCache overrides the package-level cliStoreCache with the
+// given store and registers cleanup to restore the prior contents. Tests
+// that exercise bead-store lookups from CLI functions need this because
+// the cache is process-wide and would otherwise leak between tests.
+func injectCliStoreCache(t *testing.T, cityPath string, store beads.Store) {
+	t.Helper()
+	cliStoreCache.mu.Lock()
+	prevPath := cliStoreCache.path
+	prevStore := cliStoreCache.store
+	cliStoreCache.path = cityPath
+	cliStoreCache.store = store
+	cliStoreCache.mu.Unlock()
+	t.Cleanup(func() {
+		cliStoreCache.mu.Lock()
+		cliStoreCache.path = prevPath
+		cliStoreCache.store = prevStore
+		cliStoreCache.mu.Unlock()
+	})
+}
+
+// TestCityStatusPoolUsesBeadDerivedSessionNames verifies that gc status
+// resolves pool instance running state by consulting the bead store for
+// the actual session_name (e.g. "polecat-lx-abc"), not the synthetic
+// name that cliSessionName would compute from the instance qualified
+// name. Regression for gc-124: without this lookup, pool slots whose
+// runtime session uses a bead-derived name are incorrectly reported
+// as stopped.
+func TestCityStatusPoolUsesBeadDerivedSessionNames(t *testing.T) {
+	sp := runtime.NewFake()
+	if err := sp.Start(context.Background(), "polecat-lx-abc", runtime.Config{Command: "echo"}); err != nil {
+		t.Fatal(err)
+	}
+	dops := newFakeDrainOps()
+
+	cityPath := t.TempDir()
+	store := beads.NewMemStore()
+	if _, err := store.Create(beads.Bead{
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel, "agent:gascity/polecat"},
+		Metadata: map[string]string{
+			"agent_name":   "gascity/polecat",
+			"template":     "gascity/polecat",
+			"pool_slot":    "1",
+			"pool_managed": boolMetadata(true),
+			"session_name": "polecat-lx-abc",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	injectCliStoreCache(t, cityPath, store)
+
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "loomington"},
+		Agents: []config.Agent{
+			{Name: "polecat", Dir: "gascity", MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(3), ScaleCheck: "echo 1"},
+		},
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := doCityStatus(sp, dops, cfg, cityPath, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("code = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	out := stdout.String()
+
+	if !strings.Contains(out, "pool (min=0, max=3)") {
+		t.Errorf("stdout missing pool header, got:\n%s", out)
+	}
+	// Slot 1 is backed by the fake runtime session polecat-lx-abc.
+	// The display name stays the instance-qualified form.
+	if !strings.Contains(out, "gascity/polecat-1") {
+		t.Errorf("stdout missing gascity/polecat-1, got:\n%s", out)
+	}
+	// With the fix, slot 1 should be reported as running; without it,
+	// every slot would show stopped and the summary would be 0/3.
+	if !strings.Contains(out, "1/3 agents running") {
+		t.Errorf("stdout missing '1/3 agents running' (bead-derived session lookup failed), got:\n%s", out)
+	}
+}
+
+// TestCityStatusJSONPoolUsesBeadDerivedSessionNames mirrors the above
+// for the JSON output path.
+func TestCityStatusJSONPoolUsesBeadDerivedSessionNames(t *testing.T) {
+	sp := runtime.NewFake()
+	if err := sp.Start(context.Background(), "polecat-lx-def", runtime.Config{Command: "echo"}); err != nil {
+		t.Fatal(err)
+	}
+
+	cityPath := t.TempDir()
+	store := beads.NewMemStore()
+	if _, err := store.Create(beads.Bead{
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel, "agent:gascity/polecat"},
+		Metadata: map[string]string{
+			"agent_name":   "gascity/polecat",
+			"template":     "gascity/polecat",
+			"pool_slot":    "2",
+			"pool_managed": boolMetadata(true),
+			"session_name": "polecat-lx-def",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	injectCliStoreCache(t, cityPath, store)
+
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "loomington"},
+		Agents: []config.Agent{
+			{Name: "polecat", Dir: "gascity", MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(3), ScaleCheck: "echo 1"},
+		},
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := doCityStatusJSON(sp, cfg, cityPath, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("code = %d, want 0; stderr: %s", code, stderr.String())
+	}
+
+	var status StatusJSON
+	if err := json.Unmarshal(stdout.Bytes(), &status); err != nil {
+		t.Fatalf("unmarshal: %v; output: %s", err, stdout.String())
+	}
+	if status.Summary.RunningAgents != 1 {
+		t.Errorf("Summary.RunningAgents = %d, want 1 (bead-derived session lookup failed)", status.Summary.RunningAgents)
+	}
+	var slot2 *StatusAgentJSON
+	for i := range status.Agents {
+		if status.Agents[i].QualifiedName == "gascity/polecat-2" {
+			slot2 = &status.Agents[i]
+			break
+		}
+	}
+	if slot2 == nil {
+		t.Fatalf("gascity/polecat-2 missing from Agents: %#v", status.Agents)
+	}
+	if !slot2.Running {
+		t.Errorf("gascity/polecat-2.Running = false, want true")
 	}
 }
 
