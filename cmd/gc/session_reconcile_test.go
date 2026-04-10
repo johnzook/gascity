@@ -1871,3 +1871,128 @@ func TestHealExpiredTimers_ClearsChurnOnQuarantineExpiry(t *testing.T) {
 		t.Errorf("sleep_reason = %q, want empty", session.Metadata["sleep_reason"])
 	}
 }
+
+func TestSessionHasActionableAssignedWork(t *testing.T) {
+	session := beads.Bead{
+		ID: "lx-oh4gnm",
+		Metadata: map[string]string{
+			"session_name":              "polecat-lx-oh4gnm",
+			"template":                  "gascity/polecat",
+			"configured_named_identity": "",
+		},
+	}
+
+	tests := []struct {
+		name string
+		work []beads.Bead
+		want bool
+	}{
+		{
+			name: "no work beads",
+			work: nil,
+			want: false,
+		},
+		{
+			name: "work assigned by bead ID",
+			work: []beads.Bead{{
+				ID: "gc-ds0", Status: "in_progress", Assignee: "lx-oh4gnm",
+			}},
+			want: true,
+		},
+		{
+			name: "work assigned by session_name (the polecat case)",
+			work: []beads.Bead{{
+				ID: "gc-ds0", Status: "in_progress", Assignee: "polecat-lx-oh4gnm",
+			}},
+			want: true,
+		},
+		{
+			name: "work assigned by template alias",
+			work: []beads.Bead{{
+				ID: "gc-ds0", Status: "in_progress", Assignee: "gascity/polecat",
+			}},
+			want: true,
+		},
+		{
+			name: "open work counts (just claimed, before in_progress)",
+			work: []beads.Bead{{
+				ID: "gc-ds0", Status: "open", Assignee: "polecat-lx-oh4gnm",
+			}},
+			want: true,
+		},
+		{
+			name: "closed work does not count",
+			work: []beads.Bead{{
+				ID: "gc-ds0", Status: "closed", Assignee: "polecat-lx-oh4gnm",
+			}},
+			want: false,
+		},
+		{
+			name: "blocked work does not count",
+			work: []beads.Bead{{
+				ID: "gc-ds0", Status: "blocked", Assignee: "polecat-lx-oh4gnm",
+			}},
+			want: false,
+		},
+		{
+			name: "unassigned work does not count",
+			work: []beads.Bead{{
+				ID: "gc-ds0", Status: "in_progress", Assignee: "",
+			}},
+			want: false,
+		},
+		{
+			name: "assignee for a different session does not match",
+			work: []beads.Bead{{
+				ID: "gc-ds0", Status: "in_progress", Assignee: "polecat-lx-other",
+			}},
+			want: false,
+		},
+		{
+			name: "mixed work — at least one matching counts",
+			work: []beads.Bead{
+				{ID: "gc-001", Status: "in_progress", Assignee: "polecat-lx-other"},
+				{ID: "gc-002", Status: "in_progress", Assignee: "polecat-lx-oh4gnm"},
+			},
+			want: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := sessionHasActionableAssignedWork(session, tt.work)
+			if got != tt.want {
+				t.Errorf("sessionHasActionableAssignedWork = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSessionHasActionableAssignedWork_NamedIdentity(t *testing.T) {
+	session := beads.Bead{
+		ID: "lx-named",
+		Metadata: map[string]string{
+			"session_name":              "test-city-refinery",
+			"template":                  "gascity/refinery",
+			"configured_named_identity": "gascity/refinery",
+		},
+	}
+	work := []beads.Bead{{
+		ID: "gc-ds0", Status: "in_progress", Assignee: "gascity/refinery",
+	}}
+	if !sessionHasActionableAssignedWork(session, work) {
+		t.Error("named identity assignee should match configured_named_identity")
+	}
+}
+
+func TestSessionHasActionableAssignedWork_EmptyMetadataDoesNotMatchEmptyAssignee(t *testing.T) {
+	// Defensive: if a session has empty session_name, an empty-assignee
+	// work bead must NOT cross-match. The early "assignee == ''" filter
+	// already prevents this, but verify it explicitly.
+	session := beads.Bead{ID: "x", Metadata: map[string]string{}}
+	work := []beads.Bead{{
+		ID: "w1", Status: "in_progress", Assignee: "",
+	}}
+	if sessionHasActionableAssignedWork(session, work) {
+		t.Error("empty assignee must not match empty session metadata")
+	}
+}

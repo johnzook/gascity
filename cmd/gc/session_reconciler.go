@@ -276,6 +276,21 @@ func reconcileSessionBeadsTraced(
 						fmt.Fprintf(stdout, "Skipping drain for '%s': store query partial (transient failure)\n", name) //nolint:errcheck
 						continue
 					}
+					// Backstop: if the session has actionable assigned
+					// work, skip the orphan drain. The resume tier should
+					// have kept it in desiredState — arriving here means
+					// something upstream lost the demand signal. Killing
+					// the session would interrupt the running agent
+					// mid-tool-call (gc-ds0).
+					if sessionHasActionableAssignedWork(*session, assignedWorkBeads) {
+						fmt.Fprintf(stdout, "Skipping drain for '%s': session has actionable assigned work\n", name) //nolint:errcheck
+						if trace != nil {
+							trace.recordDecision("reconciler.session.orphan_or_suspended", normalizedSessionTemplate(*session, cfg), name, "actionable_work_fence", "skipped", traceRecordPayload{
+								"provider_alive": providerAlive,
+							}, nil, "")
+						}
+						continue
+					}
 					reason := "orphaned"
 					if configuredNames[name] {
 						reason = "suspended"
@@ -530,6 +545,25 @@ func reconcileSessionBeadsTraced(
 							}
 							continue
 						}
+						// Defer config-drift drain while the session has
+						// actionable assigned work. Killing a polecat
+						// mid-tool-call (e.g. during go test ./...) loses
+						// work and triggers wake/drain churn. The drift
+						// will be applied after the work completes and
+						// the session naturally exits or sleeps. Spurious
+						// drift (transient I/O on probed CopyFiles content
+						// hashes, fingerprint flips) self-resolves on a
+						// later tick (gc-ds0).
+						if sessionHasActionableAssignedWork(*session, assignedWorkBeads) {
+							if trace != nil {
+								trace.recordDecision("reconciler.session.config_drift", tp.TemplateName, name, "config_drift", "deferred_actionable_work", traceRecordPayload{
+									"stored_hash":  storedHash,
+									"current_hash": currentHash,
+								}, nil, "")
+							}
+							fmt.Fprintf(stdout, "Deferring config-drift drain for '%s': session has actionable assigned work\n", name) //nolint:errcheck
+							continue
+						}
 						ddt := driftDrainTimeout
 						if ddt <= 0 {
 							ddt = defaultDrainTimeout
@@ -701,6 +735,28 @@ func reconcileSessionBeadsTraced(
 		}
 
 		if !shouldWake && target.alive {
+			// Backstop: if the session has actionable assigned work,
+			// don't drain it regardless of wake decision. This catches
+			// cases where the demand signal got lost between
+			// ComputePoolDesiredStates and ComputeAwakeSet (transient
+			// store failures, fingerprint drift, race conditions). The
+			// polecat is in the middle of a tool call; killing it would
+			// lose work and start a wake/drain loop (gc-ds0).
+			//
+			// Skip the fence for explicit sleep intents — those are
+			// agent-initiated drains (e.g. drain-ack, idle-stop-pending)
+			// where the agent has already signaled it's done with the
+			// work and the drain should proceed.
+			if target.session.Metadata["sleep_intent"] == "" &&
+				sessionHasActionableAssignedWork(*target.session, assignedWorkBeads) {
+				cancelSessionDrain(*target.session, sp, dt)
+				if trace != nil {
+					trace.recordDecision("reconciler.session.drain", target.tp.TemplateName, name, "actionable_work_fence", "skipped", traceRecordPayload{
+						"would_drain_reason": "no-wake-reason",
+					}, nil, "")
+				}
+				continue
+			}
 			// No reason to be awake — begin drain.
 			intent := target.session.Metadata["sleep_intent"]
 			var reason string

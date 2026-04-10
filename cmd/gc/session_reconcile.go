@@ -750,6 +750,46 @@ func isPoolExcess(session beads.Bead, cfg *config.City, poolDesired map[string]i
 	return poolDesired[template] <= 0
 }
 
+// sessionHasActionableAssignedWork returns true if any work bead in
+// assignedWorkBeads is assigned to this session — by bead ID, session_name,
+// configured_named_identity, or template alias.
+//
+// Used as a fence at drain decision sites: a session that has actionable
+// in-progress (or open) work assigned to it must never be drained, even if
+// other heuristics (config-drift detection, no-wake-reason, orphan check)
+// say it should. Killing such a session interrupts whatever tool call the
+// agent was running mid-execution and triggers a wake/drain loop on the
+// next tick when the work signal reappears (gc-ds0).
+//
+// The match identifiers mirror compute_awake_set.go's "assigned-work" loop
+// so this fence is consistent with how ComputeAwakeSet decides to wake.
+func sessionHasActionableAssignedWork(session beads.Bead, assignedWorkBeads []beads.Bead) bool {
+	if len(assignedWorkBeads) == 0 {
+		return false
+	}
+	sessionID := session.ID
+	sessionName := strings.TrimSpace(session.Metadata["session_name"])
+	namedIdentity := strings.TrimSpace(session.Metadata["configured_named_identity"])
+	template := strings.TrimSpace(session.Metadata["template"])
+
+	for _, wb := range assignedWorkBeads {
+		if wb.Status != "in_progress" && wb.Status != "open" {
+			continue
+		}
+		assignee := strings.TrimSpace(wb.Assignee)
+		if assignee == "" {
+			continue
+		}
+		if (sessionID != "" && assignee == sessionID) ||
+			(sessionName != "" && assignee == sessionName) ||
+			(namedIdentity != "" && assignee == namedIdentity) ||
+			(template != "" && assignee == template) {
+			return true
+		}
+	}
+	return false
+}
+
 // healState updates advisory state metadata only when changed (dirty check).
 func healState(session *beads.Bead, alive bool, store beads.Store, clk clock.Clock) {
 	if session != nil && !alive && strings.TrimSpace(session.Metadata["state"]) == "drained" {

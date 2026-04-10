@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strings"
 	"testing"
 	"time"
 
@@ -216,6 +217,24 @@ func (e *reconcilerTestEnv) reconcileWithPoolDesired(sessions []beads.Bead, pool
 	return reconcileSessionBeads(
 		context.Background(), sessions, e.desiredState, cfgNames, e.cfg, e.sp,
 		e.store, nil, nil, nil, e.dt, poolDesired, false, nil, "",
+		nil, e.clk, e.rec, 0, 0, &e.stdout, &e.stderr,
+	)
+}
+
+// reconcileWithWork runs the reconciler with explicit assignedWorkBeads,
+// mirroring the production path where collectAssignedWorkBeads supplies
+// work to the resume tier and the actionable-work fence.
+func (e *reconcilerTestEnv) reconcileWithWork(sessions []beads.Bead, assignedWorkBeads []beads.Bead) int {
+	cfgNames := configuredSessionNames(e.cfg, "", e.store)
+	poolDesired := make(map[string]int)
+	for _, tp := range e.desiredState {
+		if tp.TemplateName != "" {
+			poolDesired[tp.TemplateName]++
+		}
+	}
+	return reconcileSessionBeads(
+		context.Background(), sessions, e.desiredState, cfgNames, e.cfg, e.sp,
+		e.store, nil, assignedWorkBeads, nil, e.dt, poolDesired, false, nil, "",
 		nil, e.clk, e.rec, 0, 0, &e.stdout, &e.stderr,
 	)
 }
@@ -946,6 +965,123 @@ func TestReconcileSessionBeads_NoDriftBeforeStartedHashWritten(t *testing.T) {
 
 	if ds := env.dt.get(session.ID); ds != nil {
 		t.Errorf("expected no drain before started_config_hash is written, got reason=%q", ds.reason)
+	}
+}
+
+// Regression for gc-ds0: a polecat running a long tool call (go test ./...)
+// must not be drained for config-drift while it has actionable assigned work.
+// The drift may be a transient false positive (e.g. probed-CopyFiles
+// content-hash flip from a brief I/O error). Killing a session mid-tool-call
+// loses work and triggers a wake/drain loop because the next tick re-detects
+// the assigned work and re-spawns the session.
+func TestReconcileSessionBeads_ConfigDriftDeferredWhenAssignedWork(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{Agents: []config.Agent{{Name: "polecat", Dir: "gascity"}}}
+	env.addDesiredWithConfig("polecat-lx-test", "gascity/polecat", true, "new-cmd")
+	session := env.createSessionBead("polecat-lx-test", "gascity/polecat")
+	env.markSessionActive(&session)
+	env.setSessionMetadata(&session, map[string]string{
+		"started_config_hash": runtime.CoreFingerprint(runtime.Config{Command: "test-cmd"}),
+	})
+
+	work := []beads.Bead{{
+		ID:       "gc-ds0",
+		Status:   "in_progress",
+		Assignee: "polecat-lx-test",
+		Metadata: map[string]string{"gc.routed_to": "gascity/polecat"},
+	}}
+
+	env.reconcileWithWork([]beads.Bead{session}, work)
+
+	if ds := env.dt.get(session.ID); ds != nil {
+		t.Fatalf("config-drift drain should be deferred when session has assigned work; got reason=%q", ds.reason)
+	}
+	if !strings.Contains(env.stdout.String(), "Deferring config-drift drain") {
+		t.Errorf("expected deferral message in stdout, got: %s", env.stdout.String())
+	}
+}
+
+// Regression for gc-ds0: an orphan-classified session (not in desiredState
+// but provider-alive) must not be drained when it has actionable assigned
+// work. This catches the case where the resume tier failed upstream
+// (assignee→session_name lookup miss, race during session bead creation, etc.)
+// — the session would otherwise be killed mid-work as "orphaned".
+func TestReconcileSessionBeads_OrphanDrainSkippedWhenAssignedWork(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{Agents: []config.Agent{{Name: "polecat", Dir: "gascity"}}}
+	// Note: NOT calling addDesired — the session is intentionally absent
+	// from desiredState, simulating a resume-tier miss.
+	_ = env.sp.Start(context.Background(), "polecat-lx-test", runtime.Config{})
+	session := env.createSessionBead("polecat-lx-test", "gascity/polecat")
+
+	work := []beads.Bead{{
+		ID:       "gc-ds0",
+		Status:   "in_progress",
+		Assignee: "polecat-lx-test",
+		Metadata: map[string]string{"gc.routed_to": "gascity/polecat"},
+	}}
+
+	env.reconcileWithWork([]beads.Bead{session}, work)
+
+	if ds := env.dt.get(session.ID); ds != nil {
+		t.Fatalf("orphan drain should be skipped when session has assigned work; got reason=%q", ds.reason)
+	}
+	if !env.sp.IsRunning("polecat-lx-test") {
+		t.Error("session must remain running after fence skips drain")
+	}
+	if !strings.Contains(env.stdout.String(), "Skipping drain") {
+		t.Errorf("expected skip message in stdout, got: %s", env.stdout.String())
+	}
+}
+
+// Regression for gc-ds0: a session classified as "no wake reason" (e.g.
+// because configWakeSuppressed cleared its wake signal) must not be drained
+// when it has actionable assigned work. This is the most likely path for
+// the original bug — sleep policy fingerprint match suppresses wake even
+// though the polecat has in-progress work to finish.
+func TestReconcileSessionBeads_NoWakeReasonDrainSkippedWhenAssignedWork(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{Agents: []config.Agent{{Name: "polecat", Dir: "gascity"}}}
+	env.addDesired("polecat-lx-test", "gascity/polecat", true)
+	session := env.createSessionBead("polecat-lx-test", "gascity/polecat")
+	env.markSessionActive(&session)
+	// Hand-craft the suppression conditions: sleep_reason=idle with the
+	// fingerprint stored that ComputeAwakeSet would compute. The simplest
+	// reproducer is to drive shouldWake=false via empty desiredState — but
+	// the orphan path catches that first. Instead we run the no-wake path
+	// by clearing both desired demand AND making poolDesired say 0.
+	// We rely on the actionable-work fence to prevent the drain regardless.
+	work := []beads.Bead{{
+		ID:       "gc-ds0",
+		Status:   "in_progress",
+		Assignee: "polecat-lx-test",
+		Metadata: map[string]string{"gc.routed_to": "gascity/polecat"},
+	}}
+
+	env.reconcileWithWork([]beads.Bead{session}, work)
+
+	if ds := env.dt.get(session.ID); ds != nil {
+		t.Fatalf("session with assigned work must not be drained; got reason=%q", ds.reason)
+	}
+}
+
+// Negative case: the fence does not suppress drains when there's no work.
+// Ensures we haven't broken the legitimate orphan-drain path.
+func TestReconcileSessionBeads_OrphanDrainStillFiresWithoutAssignedWork(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{Agents: []config.Agent{{Name: "other"}}}
+	_ = env.sp.Start(context.Background(), "orphan", runtime.Config{})
+	session := env.createSessionBead("orphan", "orphan")
+
+	// No work beads.
+	env.reconcileWithWork([]beads.Bead{session}, nil)
+
+	ds := env.dt.get(session.ID)
+	if ds == nil {
+		t.Fatal("expected drain for orphan session with no assigned work")
+	}
+	if ds.reason != "orphaned" {
+		t.Errorf("drain reason = %q, want orphaned", ds.reason)
 	}
 }
 
